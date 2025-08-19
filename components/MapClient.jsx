@@ -14,44 +14,53 @@ const CircleMarker = dynamic(() => import("react-leaflet").then((m) => m.CircleM
 const Marker = dynamic(() => import("react-leaflet").then((m) => m.Marker), { ssr: false });
  // keep imports minimal to avoid SSR issues
 
- export default function MapClient({ points }) {
-  const latlngs = useMemo(() => points?.map((p) => [p.lat, p.lon]) ?? [], [points]);
-  const area = useMemo(() => (points && points.length >= 3 ? polygonAreaSqm(points) : 0), [points]);
-  const lengths = useMemo(() => (points && points.length >= 2 ? edgeLengthsMeters(points) : []), [points]);
+ export default function MapClient({ points, focusFirstTrigger = 0 }) {
+  const validPoints = useMemo(() => (points || []).filter((p) => Number.isFinite(p?.lat) && Number.isFinite(p?.lon)), [points]);
+  const latlngs = useMemo(() => validPoints.map((p) => [p.lat, p.lon]), [validPoints]);
+  const area = useMemo(() => (validPoints.length >= 3 ? polygonAreaSqm(validPoints) : 0), [validPoints]);
+  const lengths = useMemo(() => (validPoints.length >= 2 ? edgeLengthsMeters(validPoints) : []), [validPoints]);
 
   // Midpoints of edges for labeling
   const midpoints = useMemo(() => {
-    if (!points || points.length < 2) return [];
-    return points.map((a, i) => {
-      const b = points[(i + 1) % points.length];
+    if (!validPoints || validPoints.length < 2) return [];
+    return validPoints.map((a, i) => {
+      const b = validPoints[(i + 1) % validPoints.length];
       return { lat: (a.lat + b.lat) / 2, lon: (a.lon + b.lon) / 2 };
     });
-  }, [points]);
+  }, [validPoints]);
 
   // Centroid for area label
-  const centroid = useMemo(() => polygonCentroid(points), [points]);
+  const centroid = useMemo(() => (validPoints.length >= 3 ? polygonCentroid(validPoints) : null), [validPoints]);
 
   const mapRef = useRef(null);
   const [mapReady, setMapReady] = useState(false);
+
+  // Compute desired initial center/zoom each time user clicks Show (focusFirstTrigger)
+  const { desiredCenter, desiredZoom } = useMemo(() => {
+    const valid = validPoints;
+    if (valid.length === 0) return { desiredCenter: [0, 0], desiredZoom: 2 };
+    if (valid.length === 1) return { desiredCenter: [valid[0].lat, valid[0].lon], desiredZoom: 19 };
+    let c = polygonCentroid(valid);
+    if (!c) {
+      const b = L.latLngBounds(valid.map((p) => [p.lat, p.lon]));
+      const center = b.getCenter();
+      c = { lat: center.lat, lon: center.lng };
+    }
+    return { desiredCenter: [c.lat, c.lon], desiredZoom: 15 };
+  }, [validPoints, focusFirstTrigger]);
+
   useEffect(() => {
     const map = mapRef.current;
     if (!mapReady || !map) return;
-    if (!points || points.length === 0) return;
-    // Invalidate size to ensure Leaflet computes bounds correctly after layout changes
     map.invalidateSize(true);
-    if (points.length === 1) {
-      map.setView([points[0].lat, points[0].lon], 19, { animate: true });
-    } else {
-      const b = L.latLngBounds(points.map((p) => [p.lat, p.lon]));
-      map.fitBounds(b, { padding: [60, 60], maxZoom: 20, animate: true });
-    }
-  }, [points, mapReady]);
+  }, [mapReady, points, focusFirstTrigger]);
 
   return (
     <MapContainer
+      key={focusFirstTrigger || 0}
       style={{ height: 500, width: "100%" }}
-      center={[0, 0]}
-      zoom={2}
+      center={desiredCenter}
+      zoom={desiredZoom}
       maxZoom={22}
       scrollWheelZoom
       whenCreated={(map) => {
@@ -65,7 +74,7 @@ const Marker = dynamic(() => import("react-leaflet").then((m) => m.Marker), { ss
         <Polyline positions={[...latlngs, latlngs[0]]} pathOptions={{ color: "#d32f2f", weight: 4 }} />
       )}
 
-      {points?.map((p, idx) => (
+      {validPoints?.map((p, idx) => (
         <div key={`wrap-${idx}`}>
           <CircleMarker center={[p.lat, p.lon]} radius={4} pathOptions={{ color: "#1a237e", weight: 2, fill: true }} />
           <Marker position={[p.lat, p.lon]} icon={L.divIcon({ className: "", html: `<div style=\"background:#fff;padding:2px 6px;border:1px solid #999;border-radius:4px;font-size:12px\">${p.name}</div>` })} />
