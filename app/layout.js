@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata = {
-  title: "اپلیکیشن نکست",
-  description: "رابط کاربری فارسی با فونت وزیرمتن",
+  title: "26040130301530120084015030120081040",
+  description: "",
 };
 
 export default function RootLayout({ children }) {
