@@ -22,28 +22,92 @@ export default function UploaderForm({ onParsed }) {
   const [rawType, setRawType] = useState(null); // 'utm' | 'wgs84'
 
   function parseText(text) {
-    // Try CSV via Papa; fallback to whitespace splitting lines
-    const parsed = Papa.parse(text.trim(), { header: true, skipEmptyLines: true });
+    // Try CSV via Papa; fallback to whitespace/CSV lines (name-first or easting-first)
+    const parsed = Papa.parse(String(text || "").trim(), { header: true, skipEmptyLines: true });
     let rows = [];
-    if (parsed && parsed.data && parsed.data.length > 0 && parsed.meta.fields) {
-      rows = parsed.data.map((r, idx) => ({
-        name: r.name || r.Name || r.point || r.Point || `P${idx + 1}`,
-        easting: Number(r.easting || r.Easting || r.x || r.X),
-        northing: Number(r.northing || r.Northing || r.y || r.Y),
-      })).filter((r) => Number.isFinite(r.easting) && Number.isFinite(r.northing));
-    } else {
-      rows = text
-        .split(/\r?\n/)
-        .map((line, idx) => line.trim())
-        .filter(Boolean)
-        .map((line, idx) => {
-          const parts = line.split(/[;,\s]+/);
-          const e = Number(parts[0]);
-          const n = Number(parts[1]);
-          const name = parts[2] || `P${idx + 1}`;
+    if (parsed && parsed.data && parsed.data.length > 0 && parsed.meta && parsed.meta.fields && parsed.meta.fields.length) {
+      rows = parsed.data
+        .map((r, idx) => {
+          const name = r.name || r.Name || r["Point name"] || r.point || r.Point || r.id || r.ID || `P${idx + 1}`;
+          const e = Number(r.easting ?? r.Easting ?? r.EASTING ?? r.x ?? r.X ?? r.E ?? r.e ?? r.east ?? r.East);
+          const n = Number(r.northing ?? r.Northing ?? r.NORTHING ?? r.y ?? r.Y ?? r.N ?? r.n ?? r.north ?? r.North);
           return { name, easting: e, northing: n };
         })
         .filter((r) => Number.isFinite(r.easting) && Number.isFinite(r.northing));
+      setRawRows(rows);
+      return rows;
+    }
+
+    // Headerless or irregular lines: support both "name,e,n" and "e,n,name"
+    const lines = String(text || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    rows = lines
+      .map((line, idx) => {
+        const parts = line.split(/[;,\s]+/).filter(Boolean);
+        let name = `P${idx + 1}`;
+        let e = Number(parts[0]);
+        let n = Number(parts[1]);
+        // Case: name first, then easting, northing
+        if (!Number.isFinite(e) && Number.isFinite(Number(parts[1])) && Number.isFinite(Number(parts[2]))) {
+          name = parts[0];
+          e = Number(parts[1]);
+          n = Number(parts[2]);
+        } else {
+          // Case: easting, northing, [name]
+          if (parts[2] && isNaN(Number(parts[2]))) name = parts[2];
+        }
+        return { name, easting: e, northing: n };
+      })
+      .filter((r) => Number.isFinite(r.easting) && Number.isFinite(r.northing));
+    setRawRows(rows);
+    return rows;
+  }
+
+  function parseTextMode2(text) {
+    const t = String(text || "").trim();
+    if (!t) {
+      setRawRows([]);
+      return [];
+    }
+    const lines = t.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const rows = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let name = `P${i + 1}`;
+      let easting = undefined;
+      let northing = undefined;
+      // Try key=value tokens first (E=..., N=..., X=..., Y=...)
+      const kvParts = line.split(/[;,\s]+/).map((s) => s.trim()).filter(Boolean);
+      for (const tok of kvParts) {
+        const m = tok.match(/^([eEnNxX]|Easting|Northing|east|north)\s*[:=]\s*(-?\d+(?:\.\d+)?)/);
+        if (m) {
+          const key = m[1].toLowerCase();
+          const val = Number(m[2]);
+          if (key === 'e' || key === 'x' || key === 'east' || key === 'easting') easting = val;
+          if (key === 'n' || key === 'y' || key === 'north' || key === 'northing') northing = val;
+          continue;
+        }
+      }
+      // If still missing, extract all numbers and pick two largest as UTM (northing>=easting)
+      if (!Number.isFinite(easting) || !Number.isFinite(northing)) {
+        const nums = (line.match(/-?\d+(?:\.\d+)?/g) || []).map(Number).filter((n) => Number.isFinite(n));
+        if (nums.length >= 2) {
+          const sorted = nums.slice().sort((a, b) => b - a);
+          const nVal = sorted[0];
+          const eVal = sorted[1];
+          // Basic sanity: swap if needed to keep northing >= easting
+          northing = Math.max(nVal, eVal);
+          easting = Math.min(nVal, eVal);
+        }
+      }
+      // Try to infer name from tokens containing letters
+      const word = kvParts.find((s) => /[A-Za-z\u0600-\u06FF]/.test(s) && !s.includes('=') && !s.includes(':'));
+      if (word) name = word;
+      if (Number.isFinite(easting) && Number.isFinite(northing)) {
+        rows.push({ name, easting: Number(easting), northing: Number(northing) });
+      }
     }
     setRawRows(rows);
     return rows;
@@ -53,7 +117,7 @@ export default function UploaderForm({ onParsed }) {
     const file = e.target.files?.[0];
     if (!file) return;
     const text = await file.text();
-    const rows = parseText(text);
+    const rows = mode === 'utm2' ? parseTextMode2(text) : parseText(text);
     setNotice(`تعداد نقاط خوانده‌شده از فایل: ${rows.length}`);
   }
 
@@ -252,7 +316,7 @@ export default function UploaderForm({ onParsed }) {
 
 
   function handleShowOnMap() {
-    if (mode === "utm") {
+    if (mode === "utm" || mode === "utm2") {
       if (rawRows.length < 2) return;
       const wgs = convertManyUtmToLatLon(rawRows, { zone: Number(zone), hemisphere });
       onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
@@ -275,27 +339,19 @@ export default function UploaderForm({ onParsed }) {
         onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
         setNotice(`DXF (UTM) روی نقشه نمایش داده شد (${wgs.length} نقطه).`);
       }
-    } else if (mode === "dwg") {
-      if (rawRows.length < 2) return;
-      if (rawType === "wgs84") {
-        const latlon = rawRows.map((p) => ({ name: p.name, lat: Number(p.northing), lon: Number(p.easting) }));
-        const enriched = convertManyLatLonToUtm(latlon, { zone: Number(zone), hemisphere });
-        onParsed?.({ points: enriched, projectInfo: { ...projectInfo, zone, hemisphere } });
-        setNotice(`DWG (WGS84) روی نقشه نمایش داده شد (${enriched.length} نقطه).`);
-      } else {
-        const wgs = convertManyUtmToLatLon(rawRows, { zone: Number(zone), hemisphere });
-        onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
-        setNotice(`DWG (UTM) روی نقشه نمایش داده شد (${wgs.length} نقطه).`);
-      }
     }
   }
 
   return (
     <div className="space-y-4">
-      <div className="flex gap-4">
+      <div className="flex gap-4 flex-wrap">
         <label className="flex items-center gap-2">
           <input type="radio" name="mode" value="utm" checked={mode === "utm"} onChange={() => setMode("utm")} />
-          <span>ورودی نقاط UTM</span>
+          <span>ورودی TXT / CSV (مود 1)</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" name="mode" value="utm2" checked={mode === "utm2"} onChange={() => setMode("utm2")} />
+          <span>ورودی TXT / CSV (مود 2)</span>
         </label>
         <label className="flex items-center gap-2">
           <input type="radio" name="mode" value="dxf" checked={mode === "dxf"} onChange={() => setMode("dxf")} />
@@ -303,26 +359,26 @@ export default function UploaderForm({ onParsed }) {
         </label>
       </div>
 
-      {mode === "utm" ? (
-        <div className="grid sm:grid-cols-2 gap-4">
+      {(mode === "utm" || mode === "utm2") ? (
+      <div className="grid sm:grid-cols-2 gap-4">
+        <label className="flex flex-col gap-1">
+          <span>فایل نقاط UTM (CSV/TXT)</span>
+          <input ref={fileRef} type="file" accept=".csv,.txt" onChange={onFileChange} className="border p-2 rounded" />
+        </label>
+        <div className="grid grid-cols-2 gap-4">
           <label className="flex flex-col gap-1">
-            <span>فایل نقاط UTM (CSV/TXT)</span>
-            <input ref={fileRef} type="file" accept=".csv,.txt" onChange={onFileChange} className="border p-2 rounded" />
+            <span>زون UTM</span>
+            <input type="number" value={zone} onChange={(e) => setZone(e.target.value)} className="border p-2 rounded" />
           </label>
-          <div className="grid grid-cols-2 gap-4">
-            <label className="flex flex-col gap-1">
-              <span>زون UTM</span>
-              <input type="number" value={zone} onChange={(e) => setZone(e.target.value)} className="border p-2 rounded" />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span>نیمکره</span>
-              <select value={hemisphere} onChange={(e) => setHemisphere(e.target.value)} className="border p-2 rounded">
-                <option value="north">شمالی</option>
-                <option value="south">جنوبی</option>
-              </select>
-            </label>
-          </div>
+          <label className="flex flex-col gap-1">
+            <span>نیمکره</span>
+            <select value={hemisphere} onChange={(e) => setHemisphere(e.target.value)} className="border p-2 rounded">
+              <option value="north">شمالی</option>
+              <option value="south">جنوبی</option>
+            </select>
+          </label>
         </div>
+      </div>
       ) : mode === "polygon" ? (
         <div className="space-y-2">
           <div className="grid grid-cols-2 gap-4">
@@ -401,7 +457,7 @@ export default function UploaderForm({ onParsed }) {
       <div className="flex gap-2 flex-nowrap">
         <button
           onClick={handleShowOnMap}
-          disabled={(mode === "utm" && rawRows.length < 2) || ((mode === "dxf" || mode === "dwg") && rawRows.length < 2)}
+          disabled={(((mode === "utm") || (mode === "utm2")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
           className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50"
         >
           نمایش روی نقشه
