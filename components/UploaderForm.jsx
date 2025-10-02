@@ -199,6 +199,107 @@ export default function UploaderForm({ onParsed }) {
     return uniquePoints;
   }
 
+  function parseTextMode4(text) {
+    const t = String(text || "").trim();
+    if (!t) {
+      setRawRows([]);
+      return [];
+    }
+    
+    // Parse CSV with header
+    const parsed = Papa.parse(t, { header: true, skipEmptyLines: true });
+    if (!parsed || !parsed.data || parsed.data.length === 0) {
+      setRawRows([]);
+      return [];
+    }
+
+    const allPoints = [];
+
+    // Process each row
+    parsed.data.forEach((row) => {
+      const name = row.name || row.Name || row["Point name"] || row.point || row.Point || row.id || row.ID || '';
+      const easting = Number(row.easting ?? row.Easting ?? row.EASTING ?? row.x ?? row.X ?? row.E ?? row.e ?? row.east ?? row.East);
+      const northing = Number(row.northing ?? row.Northing ?? row.NORTHING ?? row.y ?? row.Y ?? row.N ?? row.n ?? row.north ?? row.North);
+
+      if (!Number.isFinite(easting) || !Number.isFinite(northing) || !name) return;
+
+      allPoints.push({ name, easting, northing });
+    });
+
+    // Remove exact duplicates by coordinates
+    const uniquePoints = [];
+    const seenCoords = new Set();
+    
+    allPoints.forEach(point => {
+      const coordKey = `${point.easting.toFixed(3)},${point.northing.toFixed(3)}`;
+      if (!seenCoords.has(coordKey)) {
+        seenCoords.add(coordKey);
+        uniquePoints.push(point);
+      }
+    });
+
+    // Group points into clusters by proximity (within 1000m)
+    const pointClusters = [];
+    const processed = new Set();
+
+    uniquePoints.forEach((point, index) => {
+      if (processed.has(index)) return;
+
+      const cluster = [point];
+      processed.add(index);
+
+      // Find nearby points
+      uniquePoints.forEach((otherPoint, otherIndex) => {
+        if (processed.has(otherIndex)) return;
+        
+        const distance = Math.sqrt(
+          Math.pow(point.easting - otherPoint.easting, 2) + 
+          Math.pow(point.northing - otherPoint.northing, 2)
+        );
+
+        if (distance < 1000) { // Within 1km
+          cluster.push(otherPoint);
+          processed.add(otherIndex);
+        }
+      });
+
+      if (cluster.length >= 3) { // Only keep clusters with 3+ points
+        pointClusters.push(cluster);
+      }
+    });
+
+    // Choose the largest cluster
+    const largestCluster = pointClusters.sort((a, b) => b.length - a.length)[0] || uniquePoints;
+
+    // Sort points in clockwise order to form a proper polygon
+    const sortedPoints = sortPointsClockwise(largestCluster);
+
+    setRawRows(sortedPoints);
+    return sortedPoints;
+  }
+
+  function sortPointsClockwise(points) {
+    if (points.length < 3) return points;
+
+    // Find centroid
+    const centroid = {
+      easting: points.reduce((sum, p) => sum + p.easting, 0) / points.length,
+      northing: points.reduce((sum, p) => sum + p.northing, 0) / points.length
+    };
+
+    // Calculate angle from centroid for each point
+    const pointsWithAngles = points.map(point => ({
+      ...point,
+      angle: Math.atan2(point.northing - centroid.northing, point.easting - centroid.easting)
+    }));
+
+    // Sort by angle (clockwise)
+    pointsWithAngles.sort((a, b) => a.angle - b.angle);
+
+    // Return points without angle property
+    return pointsWithAngles.map(({ angle, ...point }) => point);
+  }
+
   async function onFileChange(e) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -208,6 +309,8 @@ export default function UploaderForm({ onParsed }) {
       rows = parseTextMode2(text);
     } else if (mode === 'utm3') {
       rows = parseTextMode3(text);
+    } else if (mode === 'utm4') {
+      rows = parseTextMode4(text);
     } else {
       rows = parseText(text);
     }
@@ -415,7 +518,7 @@ export default function UploaderForm({ onParsed }) {
 
 
   function handleShowOnMap() {
-    if (mode === "utm" || mode === "utm2" || mode === "utm3") {
+    if (mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4") {
       if (rawRows.length < 2) return;
       const wgs = convertManyUtmToLatLon(rawRows, { zone: Number(zone), hemisphere });
       onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
@@ -457,15 +560,19 @@ export default function UploaderForm({ onParsed }) {
           <span>ورودی TXT / CSV (مود 3)</span>
         </label>
         <label className="flex items-center gap-2">
+          <input type="radio" name="mode" value="utm4" checked={mode === "utm4"} onChange={() => setMode("utm4")} />
+          <span>ورودی TXT / CSV (مود 4 - هوشمند)</span>
+        </label>
+        <label className="flex items-center gap-2">
           <input type="radio" name="mode" value="dxf" checked={mode === "dxf"} onChange={() => setMode("dxf")} />
           <span>فایل DXF</span>
         </label>
       </div>
 
-      {(mode === "utm" || mode === "utm2" || mode === "utm3") ? (
+      {(mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4") ? (
       <div className="grid sm:grid-cols-2 gap-4">
         <label className="flex flex-col gap-1">
-          <span>{mode === "utm3" ? "فایل خطوط مهندسی (CSV)" : "فایل نقاط UTM (CSV/TXT)"}</span>
+          <span>{mode === "utm3" ? "فایل خطوط مهندسی (CSV)" : mode === "utm4" ? "فایل خطوط مهندسی - هوشمند (CSV)" : "فایل نقاط UTM (CSV/TXT)"}</span>
           <input ref={fileRef} type="file" accept=".csv,.txt" onChange={onFileChange} className="border p-2 rounded" />
         </label>
         <div className="grid grid-cols-2 gap-4">
@@ -560,7 +667,7 @@ export default function UploaderForm({ onParsed }) {
       <div className="flex gap-2 flex-nowrap">
         <button
           onClick={handleShowOnMap}
-          disabled={(((mode === "utm") || (mode === "utm2") || (mode === "utm3")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
+          disabled={(((mode === "utm") || (mode === "utm2") || (mode === "utm3") || (mode === "utm4")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
           className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50"
         >
           نمایش روی نقشه
