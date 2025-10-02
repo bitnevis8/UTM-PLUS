@@ -300,6 +300,876 @@ export default function UploaderForm({ onParsed }) {
     return pointsWithAngles.map(({ angle, ...point }) => point);
   }
 
+  function parseTextMode5(text) {
+    const t = String(text || "").trim();
+    if (!t) {
+      setRawRows([]);
+      return [];
+    }
+    
+    // Parse CSV with header
+    const parsed = Papa.parse(t, { header: true, skipEmptyLines: true });
+    if (!parsed || !parsed.data || parsed.data.length === 0) {
+      setRawRows([]);
+      return [];
+    }
+
+    const allPoints = [];
+    const lines = new Map(); // Map of line ID to line data
+
+    // Step 1: Process all rows and extract line information
+    parsed.data.forEach((row) => {
+      const name = row.name || row.Name || row["Point name"] || row.point || row.Point || row.id || row.ID || '';
+      const easting = Number(row.easting ?? row.Easting ?? row.EASTING ?? row.x ?? row.X ?? row.E ?? row.e ?? row.east ?? row.East);
+      const northing = Number(row.northing ?? row.Northing ?? row.NORTHING ?? row.y ?? row.Y ?? row.N ?? row.n ?? row.north ?? row.North);
+
+      if (!Number.isFinite(easting) || !Number.isFinite(northing) || !name) return;
+
+      const point = { name, easting, northing };
+      allPoints.push(point);
+
+      // Extract line information from name pattern: ProjectName-L##-P#
+      const lineMatch = name.match(/(.+)-L(\d+)-P([12])$/i);
+      if (lineMatch) {
+        const [, baseName, lineNum, pointNum] = lineMatch;
+        const lineId = `${baseName}-L${lineNum}`;
+        
+        if (!lines.has(lineId)) {
+          lines.set(lineId, { id: lineId, points: [], baseName });
+        }
+        
+        const line = lines.get(lineId);
+        line.points.push({
+          ...point,
+          pointNum: parseInt(pointNum),
+          originalIndex: parsed.data.indexOf(row)
+        });
+      }
+    });
+
+    // Step 2: Remove duplicate points (within 0.1m tolerance)
+    const uniquePoints = removeDuplicatePoints(allPoints, 0.1);
+
+    // Step 3: Detect clusters/regions
+    const clusters = detectPointClusters(uniquePoints, 300); // 300m clustering distance
+
+    // Step 4: Choose the largest meaningful cluster
+    const targetCluster = selectBestCluster(clusters, uniquePoints);
+
+    // Step 5: Build boundary using line connectivity + advanced algorithms
+    const boundaryPoints = buildOptimalBoundary(targetCluster, lines);
+
+    setRawRows(boundaryPoints);
+    return boundaryPoints;
+  }
+
+  function removeDuplicatePoints(points, tolerance = 0.1) {
+    const unique = [];
+    const processed = new Set();
+
+    points.forEach((point, index) => {
+      if (processed.has(index)) return;
+
+      // Find all points within tolerance
+      const duplicates = [index];
+      for (let i = index + 1; i < points.length; i++) {
+        if (processed.has(i)) continue;
+        
+        const other = points[i];
+        const distance = Math.sqrt(
+          Math.pow(point.easting - other.easting, 2) + 
+          Math.pow(point.northing - other.northing, 2)
+        );
+
+        if (distance <= tolerance) {
+          duplicates.push(i);
+        }
+      }
+
+      // Mark all duplicates as processed
+      duplicates.forEach(idx => processed.add(idx));
+
+      // Keep the point with the most descriptive name (prefer non-pnt names)
+      const bestPoint = duplicates
+        .map(idx => points[idx])
+        .sort((a, b) => {
+          // Prefer points that are part of lines (have L##-P# pattern)
+          const aHasLine = /-L\d+-P[12]$/i.test(a.name);
+          const bHasLine = /-L\d+-P[12]$/i.test(b.name);
+          if (aHasLine && !bHasLine) return -1;
+          if (!aHasLine && bHasLine) return 1;
+          
+          // Prefer longer, more descriptive names
+          return b.name.length - a.name.length;
+        })[0];
+
+      unique.push(bestPoint);
+    });
+
+    return unique;
+  }
+
+  function detectPointClusters(points, maxDistance) {
+    const clusters = [];
+    const processed = new Set();
+
+    points.forEach((point, index) => {
+      if (processed.has(index)) return;
+
+      const cluster = [point];
+      processed.add(index);
+
+      // Find all points within maxDistance
+      points.forEach((otherPoint, otherIndex) => {
+        if (processed.has(otherIndex)) return;
+        
+        const distance = Math.sqrt(
+          Math.pow(point.easting - otherPoint.easting, 2) + 
+          Math.pow(point.northing - otherPoint.northing, 2)
+        );
+
+        if (distance <= maxDistance) {
+          cluster.push(otherPoint);
+          processed.add(otherIndex);
+        }
+      });
+
+      if (cluster.length >= 3) {
+        clusters.push(cluster);
+      }
+    });
+
+    return clusters;
+  }
+
+  function selectBestCluster(clusters, allPoints) {
+    if (clusters.length === 0) {
+      return allPoints.length >= 3 ? allPoints : [];
+    }
+
+    // Score clusters based on size and line connectivity
+    const scoredClusters = clusters.map(cluster => {
+      const linePoints = cluster.filter(p => /-L\d+-P[12]$/i.test(p.name));
+      const score = cluster.length + (linePoints.length * 0.5); // Bonus for line points
+      return { cluster, score };
+    });
+
+    // Return the highest scoring cluster
+    return scoredClusters.sort((a, b) => b.score - a.score)[0].cluster;
+  }
+
+  function buildOptimalBoundary(points, lines) {
+    if (points.length < 3) return points;
+
+    // Try line-based boundary construction first
+    const lineBoundary = constructBoundaryFromLines(points, lines);
+    if (lineBoundary && lineBoundary.length >= 3) {
+      return lineBoundary;
+    }
+
+    // Fallback to geometric boundary detection
+    return constructGeometricBoundary(points);
+  }
+
+  function constructBoundaryFromLines(points, lines) {
+    const relevantLines = Array.from(lines.values()).filter(line => {
+      // Only include lines that have points in our target cluster
+      return line.points.some(linePoint => 
+        points.some(clusterPoint => 
+          Math.abs(linePoint.easting - clusterPoint.easting) < 1 &&
+          Math.abs(linePoint.northing - clusterPoint.northing) < 1
+        )
+      );
+    });
+
+    if (relevantLines.length < 2) return null;
+
+    // Build point connectivity graph
+    const connections = new Map();
+    const pointIndex = new Map();
+
+    relevantLines.forEach(line => {
+      if (line.points.length >= 2) {
+        // Sort line points by pointNum (P1 before P2)
+        line.points.sort((a, b) => a.pointNum - b.pointNum);
+        
+        const p1 = line.points[0];
+        const p2 = line.points[line.points.length - 1];
+        
+        const key1 = `${p1.easting.toFixed(2)},${p1.northing.toFixed(2)}`;
+        const key2 = `${p2.easting.toFixed(2)},${p2.northing.toFixed(2)}`;
+        
+        pointIndex.set(key1, p1);
+        pointIndex.set(key2, p2);
+        
+        // Add bidirectional connections
+        if (!connections.has(key1)) connections.set(key1, new Set());
+        if (!connections.has(key2)) connections.set(key2, new Set());
+        
+        connections.get(key1).add(key2);
+        connections.get(key2).add(key1);
+      }
+    });
+
+    // Find the longest connected path that forms a boundary
+    return findBoundaryPath(connections, pointIndex);
+  }
+
+  function findBoundaryPath(connections, pointIndex) {
+    const allKeys = Array.from(connections.keys());
+    if (allKeys.length < 3) return null;
+
+    // Find corner points (points with fewer connections - likely boundary corners)
+    const cornerPoints = allKeys.filter(key => connections.get(key).size <= 2);
+    
+    let bestPath = [];
+
+    // Try starting from corner points first
+    const startPoints = cornerPoints.length > 0 ? cornerPoints : allKeys.slice(0, 3);
+
+    startPoints.forEach(startKey => {
+      const path = traceBoundaryPath(startKey, connections, pointIndex);
+      if (path.length > bestPath.length) {
+        bestPath = path;
+      }
+    });
+
+    return bestPath.length >= 3 ? bestPath : null;
+  }
+
+  function traceBoundaryPath(startKey, connections, pointIndex) {
+    const path = [];
+    const visited = new Set();
+    let currentKey = startKey;
+
+    while (currentKey && !visited.has(currentKey)) {
+      path.push(pointIndex.get(currentKey));
+      visited.add(currentKey);
+
+      const neighbors = Array.from(connections.get(currentKey) || []);
+      const unvisited = neighbors.filter(n => !visited.has(n));
+
+      if (unvisited.length === 0) break;
+
+      // Choose next point based on geometric criteria
+      if (path.length >= 2 && unvisited.length > 1) {
+        currentKey = chooseBestNextPoint(path, unvisited, pointIndex);
+      } else {
+        currentKey = unvisited[0];
+      }
+    }
+
+    return path;
+  }
+
+  function chooseBestNextPoint(path, candidates, pointIndex) {
+    if (candidates.length === 1) return candidates[0];
+
+    const current = path[path.length - 1];
+    const previous = path[path.length - 2];
+
+    // Calculate the direction vector from previous to current
+    const currentDir = {
+      x: current.easting - previous.easting,
+      y: current.northing - previous.northing
+    };
+
+    // Choose the candidate that maintains the most consistent direction (smallest turn angle)
+    return candidates.reduce((best, candidate) => {
+      const candidatePoint = pointIndex.get(candidate);
+      const bestPoint = pointIndex.get(best);
+
+      const candidateDir = {
+        x: candidatePoint.easting - current.easting,
+        y: candidatePoint.northing - current.northing
+      };
+
+      const bestDir = {
+        x: bestPoint.easting - current.easting,
+        y: bestPoint.northing - current.northing
+      };
+
+      const candidateAngle = Math.abs(calculateAngleDifference(currentDir, candidateDir));
+      const bestAngle = Math.abs(calculateAngleDifference(currentDir, bestDir));
+
+      return candidateAngle < bestAngle ? candidate : best;
+    });
+  }
+
+  function calculateAngleDifference(v1, v2) {
+    const angle1 = Math.atan2(v1.y, v1.x);
+    const angle2 = Math.atan2(v2.y, v2.x);
+    let diff = angle2 - angle1;
+    
+    // Normalize to [-π, π]
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    
+    return diff;
+  }
+
+  function constructGeometricBoundary(points) {
+    // Use concave hull algorithm for better boundary detection
+    return concaveHull(points, 3); // k=3 for concave hull
+  }
+
+  function concaveHull(points, k) {
+    if (points.length < 3) return points;
+    if (points.length <= k) return sortPointsClockwise(points);
+
+    // Find the starting point (leftmost, then bottommost)
+    let start = points.reduce((min, p) => {
+      if (p.easting < min.easting) return p;
+      if (p.easting === min.easting && p.northing < min.northing) return p;
+      return min;
+    });
+
+    const hull = [start];
+    let current = start;
+    let step = 2;
+
+    while ((step === 2 || !pointsEqual(current, start)) && hull.length < points.length) {
+      if (step === 5) {
+        // If we can't close the hull, fall back to convex hull
+        return sortPointsClockwise(points);
+      }
+
+      const kNearestPoints = findKNearestPoints(current, points.filter(p => !pointsEqual(p, current)), k);
+      
+      let cPoints = kNearestPoints.sort((a, b) => {
+        const angleA = Math.atan2(a.northing - current.northing, a.easting - current.easting);
+        const angleB = Math.atan2(b.northing - current.northing, b.easting - current.easting);
+        return angleA - angleB;
+      });
+
+      let its = true;
+      let i = -1;
+
+      while (its && i < cPoints.length - 1) {
+        i++;
+        let lastPoint = hull.length > 1 ? hull[hull.length - 2] : null;
+        
+        if (lastPoint && pointsEqual(cPoints[i], lastPoint)) {
+          continue;
+        }
+
+        let j = 1;
+        its = false;
+
+        while (j < hull.length - 1) {
+          if (intersects(hull[j], hull[j + 1], current, cPoints[i])) {
+            its = true;
+            break;
+          }
+          j++;
+        }
+      }
+
+      if (its) {
+        return sortPointsClockwise(points);
+      }
+
+      current = cPoints[i];
+      hull.push(current);
+      step++;
+    }
+
+    return hull.length >= 3 ? hull : sortPointsClockwise(points);
+  }
+
+  function findKNearestPoints(point, candidates, k) {
+    return candidates
+      .map(p => ({
+        ...p,
+        distance: Math.sqrt(Math.pow(p.easting - point.easting, 2) + Math.pow(p.northing - point.northing, 2))
+      }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, k)
+      .map(({ distance, ...p }) => p);
+  }
+
+  function pointsEqual(p1, p2) {
+    return Math.abs(p1.easting - p2.easting) < 0.01 && Math.abs(p1.northing - p2.northing) < 0.01;
+  }
+
+  function intersects(p1, p2, p3, p4) {
+    const ccw = (A, B, C) => (C.northing - A.northing) * (B.easting - A.easting) > (B.northing - A.northing) * (C.easting - A.easting);
+    return ccw(p1, p3, p4) !== ccw(p2, p3, p4) && ccw(p1, p2, p3) !== ccw(p1, p2, p4);
+  }
+
+  function parseTextMode6(text) {
+    const t = String(text || "").trim();
+    if (!t) {
+      setRawRows([]);
+      return [];
+    }
+    
+    // Parse CSV with header
+    const parsed = Papa.parse(t, { header: true, skipEmptyLines: true });
+    if (!parsed || !parsed.data || parsed.data.length === 0) {
+      setRawRows([]);
+      return [];
+    }
+
+    // MODE 6 - Professional Processing
+    const config = {
+      crs: "EPSG:32639",
+      duplicate_tolerance_m: 0.01,
+      cluster_eps_m: 25.0,
+      min_polygon_vertices: 3
+    };
+
+    const results = processMode6Data(parsed.data, config);
+    
+    // Return the best polygon for display
+    const bestPolygon = selectBestPolygonForDisplay(results);
+    
+    setRawRows(bestPolygon);
+    
+    // Store results for download
+    window.mode6Results = results;
+    
+    return bestPolygon;
+  }
+
+  function processMode6Data(rawData, config) {
+    const results = {
+      all_points: [],
+      duplicates_mapping: [],
+      clusters_summary: [],
+      lines: [],
+      polygons: [],
+      validation_report: [],
+      summary: {
+        total_points: rawData.length,
+        crs: config.crs,
+        warnings: [],
+        methods_used: []
+      }
+    };
+
+    // Step 1: Read and clean data
+    const cleanedData = rawData.map((row, index) => {
+      const name = String(row.name || row.Name || row["Point name"] || row.point || row.Point || row.id || row.ID || `P${index + 1}`).trim();
+      const easting = Number(row.easting ?? row.Easting ?? row.EASTING ?? row.x ?? row.X ?? row.E ?? row.e ?? row.east ?? row.East);
+      const northing = Number(row.northing ?? row.Northing ?? row.NORTHING ?? row.y ?? row.Y ?? row.N ?? row.n ?? row.north ?? row.North);
+      const code = String(row.code || row.Code || '').trim();
+      const description = String(row.description || row.Description || '').trim();
+
+      return {
+        id: index,
+        name,
+        easting,
+        northing,
+        code,
+        description,
+        valid: Number.isFinite(easting) && Number.isFinite(northing)
+      };
+    }).filter(point => point.valid);
+
+    results.all_points = cleanedData;
+    results.summary.valid_points = cleanedData.length;
+
+    // Step 2: Detect duplicates
+    const duplicateInfo = detectDuplicates(cleanedData, config.duplicate_tolerance_m);
+    results.duplicates_mapping = duplicateInfo.mapping;
+    results.summary.duplicate_clusters = duplicateInfo.clusters.length;
+
+    // Step 3: DBSCAN Clustering
+    const clusters = performDBSCAN(cleanedData, config.cluster_eps_m);
+    results.clusters_summary = clusters.summary;
+    results.summary.spatial_clusters = clusters.clusters.length;
+
+    // Step 4: Polyline detection
+    const polylines = detectPolylines(cleanedData);
+    results.lines = polylines;
+    results.summary.polylines_detected = polylines.length;
+
+    // Step 5: Polygon construction per cluster
+    clusters.clusters.forEach(cluster => {
+      if (cluster.points.length >= config.min_polygon_vertices) {
+        const polygon = constructPolygon(cluster.points, cluster.id);
+        if (polygon) {
+          results.polygons.push(polygon);
+        }
+      }
+    });
+
+    // Step 6: Validation
+    results.polygons.forEach(polygon => {
+      const validation = validatePolygon(polygon);
+      results.validation_report.push(validation);
+      if (!validation.valid) {
+        results.summary.warnings.push(`Polygon ${polygon.cluster_id}: ${validation.issues.join(', ')}`);
+      }
+    });
+
+    results.summary.methods_used = [
+      'DBSCAN clustering',
+      'Duplicate detection',
+      'Polyline extraction',
+      'Polygon construction',
+      'Geometric validation'
+    ];
+
+    return results;
+  }
+
+  function detectDuplicates(points, tolerance) {
+    const clusters = [];
+    const mapping = [];
+    const processed = new Set();
+
+    points.forEach((point, index) => {
+      if (processed.has(index)) return;
+
+      const duplicateGroup = [point];
+      processed.add(index);
+
+      // Find all points within tolerance
+      points.forEach((otherPoint, otherIndex) => {
+        if (processed.has(otherIndex)) return;
+        
+        const distance = Math.sqrt(
+          Math.pow(point.easting - otherPoint.easting, 2) + 
+          Math.pow(point.northing - otherPoint.northing, 2)
+        );
+
+        if (distance <= tolerance) {
+          duplicateGroup.push(otherPoint);
+          processed.add(otherIndex);
+        }
+      });
+
+      if (duplicateGroup.length > 1) {
+        const clusterId = clusters.length;
+        clusters.push(duplicateGroup);
+        
+        const kept = duplicateGroup[0];
+        const duplicates = duplicateGroup.slice(1);
+        
+        duplicates.forEach(dup => {
+          mapping.push({
+            cluster_id: clusterId,
+            kept_point: kept.name,
+            duplicate_point: dup.name,
+            dx: Math.abs(kept.easting - dup.easting),
+            dy: Math.abs(kept.northing - dup.northing)
+          });
+        });
+      }
+    });
+
+    return { clusters, mapping };
+  }
+
+  function performDBSCAN(points, eps) {
+    const clusters = [];
+    const visited = new Set();
+    const clustered = new Set();
+
+    function regionQuery(pointIndex) {
+      const neighbors = [];
+      const point = points[pointIndex];
+      
+      points.forEach((otherPoint, otherIndex) => {
+        if (pointIndex === otherIndex) return;
+        
+        const distance = Math.sqrt(
+          Math.pow(point.easting - otherPoint.easting, 2) + 
+          Math.pow(point.northing - otherPoint.northing, 2)
+        );
+        
+        if (distance <= eps) {
+          neighbors.push(otherIndex);
+        }
+      });
+      
+      return neighbors;
+    }
+
+    function expandCluster(pointIndex, neighbors, clusterId) {
+      const cluster = { id: clusterId, points: [points[pointIndex]] };
+      clustered.add(pointIndex);
+      
+      let i = 0;
+      while (i < neighbors.length) {
+        const neighborIndex = neighbors[i];
+        
+        if (!visited.has(neighborIndex)) {
+          visited.add(neighborIndex);
+          const neighborNeighbors = regionQuery(neighborIndex);
+          
+          if (neighborNeighbors.length >= 1) { // min_samples = 1 for our use case
+            neighbors.push(...neighborNeighbors.filter(n => !neighbors.includes(n)));
+          }
+        }
+        
+        if (!clustered.has(neighborIndex)) {
+          cluster.points.push(points[neighborIndex]);
+          clustered.add(neighborIndex);
+        }
+        
+        i++;
+      }
+      
+      return cluster;
+    }
+
+    let clusterId = 0;
+    
+    points.forEach((point, index) => {
+      if (visited.has(index)) return;
+      
+      visited.add(index);
+      const neighbors = regionQuery(index);
+      
+      if (neighbors.length >= 1) { // min_samples = 1
+        const cluster = expandCluster(index, neighbors, clusterId++);
+        clusters.push(cluster);
+      } else {
+        // Noise point becomes its own cluster
+        clusters.push({ id: clusterId++, points: [point] });
+      }
+    });
+
+    // Generate summary
+    const summary = clusters.map(cluster => {
+      const eastings = cluster.points.map(p => p.easting);
+      const northings = cluster.points.map(p => p.northing);
+      
+      return {
+        cluster_id: cluster.id,
+        number_of_points: cluster.points.length,
+        bounding_box: {
+          min_easting: Math.min(...eastings),
+          max_easting: Math.max(...eastings),
+          min_northing: Math.min(...northings),
+          max_northing: Math.max(...northings)
+        }
+      };
+    });
+
+    return { clusters, summary };
+  }
+
+  function detectPolylines(points) {
+    const lineGroups = new Map();
+    
+    points.forEach(point => {
+      // Look for pattern: prefix-P<digit>
+      const match = point.name.match(/^(.+)-P(\d+)$/i);
+      if (match) {
+        const [, prefix, digit] = match;
+        
+        if (!lineGroups.has(prefix)) {
+          lineGroups.set(prefix, []);
+        }
+        
+        lineGroups.get(prefix).push({
+          ...point,
+          sequence: parseInt(digit)
+        });
+      }
+    });
+
+    const polylines = [];
+    
+    lineGroups.forEach((linePoints, prefix) => {
+      if (linePoints.length >= 2) {
+        // Sort by sequence number
+        linePoints.sort((a, b) => a.sequence - b.sequence);
+        
+        polylines.push({
+          id: prefix,
+          points: linePoints,
+          type: 'polyline'
+        });
+      }
+    });
+
+    return polylines;
+  }
+
+  function constructPolygon(clusterPoints, clusterId) {
+    if (clusterPoints.length < 3) return null;
+
+    let orderedPoints;
+
+    // Method 1: Check for numeric suffix (pnt001, pnt002, etc.)
+    const numericPattern = /(\d+)$/;
+    const hasNumericSuffix = clusterPoints.every(p => numericPattern.test(p.name));
+    
+    if (hasNumericSuffix) {
+      orderedPoints = [...clusterPoints].sort((a, b) => {
+        const aNum = parseInt(a.name.match(numericPattern)[1]);
+        const bNum = parseInt(b.name.match(numericPattern)[1]);
+        return aNum - bNum;
+      });
+    } else {
+      // Method 2: Sort by polar angle from centroid
+      const centroid = {
+        easting: clusterPoints.reduce((sum, p) => sum + p.easting, 0) / clusterPoints.length,
+        northing: clusterPoints.reduce((sum, p) => sum + p.northing, 0) / clusterPoints.length
+      };
+
+      orderedPoints = [...clusterPoints].sort((a, b) => {
+        const angleA = Math.atan2(a.northing - centroid.northing, a.easting - centroid.easting);
+        const angleB = Math.atan2(b.northing - centroid.northing, b.easting - centroid.easting);
+        return angleA - angleB;
+      });
+    }
+
+    // Check for self-intersection
+    if (hasSelfintersection(orderedPoints)) {
+      // Fallback to convex hull
+      orderedPoints = computeConvexHull(clusterPoints);
+    }
+
+    // Close polygon by repeating first point
+    const closedPolygon = [...orderedPoints, orderedPoints[0]];
+
+    return {
+      cluster_id: clusterId,
+      points: closedPolygon,
+      method: hasNumericSuffix ? 'numeric_sort' : 'polar_angle',
+      type: 'polygon'
+    };
+  }
+
+  function hasSelfintersection(points) {
+    if (points.length < 4) return false;
+
+    for (let i = 0; i < points.length; i++) {
+      for (let j = i + 2; j < points.length; j++) {
+        if (i === 0 && j === points.length - 1) continue; // Skip adjacent edges
+        
+        const p1 = points[i];
+        const p2 = points[(i + 1) % points.length];
+        const p3 = points[j];
+        const p4 = points[(j + 1) % points.length];
+        
+        if (intersects(p1, p2, p3, p4)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function computeConvexHull(points) {
+    if (points.length < 3) return points;
+    
+    // Graham scan algorithm
+    const sorted = [...points].sort((a, b) => {
+      if (a.easting !== b.easting) return a.easting - b.easting;
+      return a.northing - b.northing;
+    });
+    
+    const cross = (o, a, b) => {
+      return (a.easting - o.easting) * (b.northing - o.northing) - 
+             (a.northing - o.northing) * (b.easting - o.easting);
+    };
+    
+    // Build lower hull
+    const lower = [];
+    for (const point of sorted) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
+        lower.pop();
+      }
+      lower.push(point);
+    }
+    
+    // Build upper hull
+    const upper = [];
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      const point = sorted[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
+        upper.pop();
+      }
+      upper.push(point);
+    }
+    
+    // Remove last point of each half because it's repeated
+    lower.pop();
+    upper.pop();
+    
+    return lower.concat(upper);
+  }
+
+  function validatePolygon(polygon) {
+    const validation = {
+      cluster_id: polygon.cluster_id,
+      valid: true,
+      issues: [],
+      area: 0,
+      orientation: 'unknown'
+    };
+
+    const points = polygon.points.slice(0, -1); // Remove duplicate last point for calculation
+
+    // Calculate area using shoelace formula
+    let area = 0;
+    for (let i = 0; i < points.length; i++) {
+      const j = (i + 1) % points.length;
+      area += points[i].easting * points[j].northing;
+      area -= points[j].easting * points[i].northing;
+    }
+    area = Math.abs(area) / 2;
+    validation.area = area;
+
+    // Check orientation
+    validation.orientation = area > 0 ? 'counterclockwise' : 'clockwise';
+
+    // Check for minimum area
+    if (area < 1) { // Less than 1 square meter
+      validation.valid = false;
+      validation.issues.push('Area too small');
+    }
+
+    // Check for self-intersection
+    if (hasSelfintersection(points)) {
+      validation.valid = false;
+      validation.issues.push('Self-intersection detected');
+    }
+
+    // Check for minimum vertices
+    if (points.length < 3) {
+      validation.valid = false;
+      validation.issues.push('Insufficient vertices');
+    }
+
+    return validation;
+  }
+
+  function selectBestPolygonForDisplay(results) {
+    if (results.polygons.length === 0) {
+      // Fallback: return all points sorted by name
+      return results.all_points.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    // Select the largest valid polygon
+    const validPolygons = results.polygons.filter(p => {
+      const validation = results.validation_report.find(v => v.cluster_id === p.cluster_id);
+      return validation && validation.valid;
+    });
+
+    if (validPolygons.length === 0) {
+      // Return the largest polygon even if invalid
+      const largestPolygon = results.polygons.sort((a, b) => b.points.length - a.points.length)[0];
+      return largestPolygon.points.slice(0, -1); // Remove duplicate last point
+    }
+
+    // Return the largest valid polygon
+    const bestPolygon = validPolygons.sort((a, b) => {
+      const aValidation = results.validation_report.find(v => v.cluster_id === a.cluster_id);
+      const bValidation = results.validation_report.find(v => v.cluster_id === b.cluster_id);
+      return bValidation.area - aValidation.area;
+    })[0];
+
+    return bestPolygon.points.slice(0, -1); // Remove duplicate last point
+  }
+
   async function onFileChange(e) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -311,6 +1181,10 @@ export default function UploaderForm({ onParsed }) {
       rows = parseTextMode3(text);
     } else if (mode === 'utm4') {
       rows = parseTextMode4(text);
+    } else if (mode === 'utm5') {
+      rows = parseTextMode5(text);
+    } else if (mode === 'utm6') {
+      rows = parseTextMode6(text);
     } else {
       rows = parseText(text);
     }
@@ -518,7 +1392,7 @@ export default function UploaderForm({ onParsed }) {
 
 
   function handleShowOnMap() {
-    if (mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4") {
+    if (mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4" || mode === "utm5" || mode === "utm6") {
       if (rawRows.length < 2) return;
       const wgs = convertManyUtmToLatLon(rawRows, { zone: Number(zone), hemisphere });
       onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
@@ -564,15 +1438,23 @@ export default function UploaderForm({ onParsed }) {
           <span>ورودی TXT / CSV (مود 4 - هوشمند)</span>
         </label>
         <label className="flex items-center gap-2">
+          <input type="radio" name="mode" value="utm5" checked={mode === "utm5"} onChange={() => setMode("utm5")} />
+          <span>ورودی TXT / CSV (مود 5 - پیشرفته)</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" name="mode" value="utm6" checked={mode === "utm6"} onChange={() => setMode("utm6")} />
+          <span>ورودی TXT / CSV (مود 6 - حرفه‌ای)</span>
+        </label>
+        <label className="flex items-center gap-2">
           <input type="radio" name="mode" value="dxf" checked={mode === "dxf"} onChange={() => setMode("dxf")} />
           <span>فایل DXF</span>
         </label>
       </div>
 
-      {(mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4") ? (
+      {(mode === "utm" || mode === "utm2" || mode === "utm3" || mode === "utm4" || mode === "utm5" || mode === "utm6") ? (
       <div className="grid sm:grid-cols-2 gap-4">
         <label className="flex flex-col gap-1">
-          <span>{mode === "utm3" ? "فایل خطوط مهندسی (CSV)" : mode === "utm4" ? "فایل خطوط مهندسی - هوشمند (CSV)" : "فایل نقاط UTM (CSV/TXT)"}</span>
+          <span>{mode === "utm3" ? "فایل خطوط مهندسی (CSV)" : mode === "utm4" ? "فایل خطوط مهندسی - هوشمند (CSV)" : mode === "utm5" ? "فایل خطوط مهندسی - پیشرفته (CSV)" : mode === "utm6" ? "فایل خطوط مهندسی - حرفه‌ای (CSV)" : "فایل نقاط UTM (CSV/TXT)"}</span>
           <input ref={fileRef} type="file" accept=".csv,.txt" onChange={onFileChange} className="border p-2 rounded" />
         </label>
         <div className="grid grid-cols-2 gap-4">
@@ -667,7 +1549,7 @@ export default function UploaderForm({ onParsed }) {
       <div className="flex gap-2 flex-nowrap">
         <button
           onClick={handleShowOnMap}
-          disabled={(((mode === "utm") || (mode === "utm2") || (mode === "utm3") || (mode === "utm4")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
+          disabled={(((mode === "utm") || (mode === "utm2") || (mode === "utm3") || (mode === "utm4") || (mode === "utm5") || (mode === "utm6")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
           className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50"
         >
           نمایش روی نقشه

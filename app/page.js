@@ -125,6 +125,84 @@ export default function Home() {
     download("polygon.kml", kml, "application/vnd.google-earth.kml+xml;charset=utf-8");
   }
 
+  function handleDownloadMode6Reports() {
+    if (!window.mode6Results) return;
+    
+    const results = window.mode6Results;
+    
+    // Download summary JSON
+    const summaryJson = JSON.stringify(results.summary, null, 2);
+    download("mode6_summary.json", summaryJson, "application/json");
+    
+    // Download duplicates mapping CSV
+    if (results.duplicates_mapping.length > 0) {
+      const duplicatesCsv = "cluster_id,kept_point,duplicate_point,dx,dy\n" + 
+        results.duplicates_mapping.map(d => `${d.cluster_id},"${d.kept_point}","${d.duplicate_point}",${d.dx},${d.dy}`).join("\n");
+      download("duplicates_mapping.csv", duplicatesCsv, "text/csv");
+    }
+    
+    // Download clusters summary CSV
+    if (results.clusters_summary.length > 0) {
+      const clustersCsv = "cluster_id,number_of_points,min_easting,max_easting,min_northing,max_northing\n" + 
+        results.clusters_summary.map(c => `${c.cluster_id},${c.number_of_points},${c.bounding_box.min_easting},${c.bounding_box.max_easting},${c.bounding_box.min_northing},${c.bounding_box.max_northing}`).join("\n");
+      download("clusters_summary.csv", clustersCsv, "text/csv");
+    }
+    
+    // Download validation report
+    if (results.validation_report.length > 0) {
+      const validationTxt = "Validation Report\n" + 
+        "================\n\n" +
+        results.validation_report.map(v => 
+          `Cluster ${v.cluster_id}:\n` +
+          `  Valid: ${v.valid}\n` +
+          `  Area: ${v.area.toFixed(2)} m²\n` +
+          `  Orientation: ${v.orientation}\n` +
+          `  Issues: ${v.issues.join(', ') || 'None'}\n`
+        ).join("\n");
+      download("validation_report.txt", validationTxt, "text/plain");
+    }
+    
+    // Download all points GeoJSON
+    const allPointsGeoJson = {
+      type: "FeatureCollection",
+      features: results.all_points.map(p => ({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [p.easting, p.northing]
+        },
+        properties: {
+          name: p.name,
+          easting: p.easting,
+          northing: p.northing,
+          code: p.code,
+          description: p.description
+        }
+      }))
+    };
+    download("all_points.geojson", JSON.stringify(allPointsGeoJson, null, 2), "application/geo+json");
+    
+    // Download polygons GeoJSON
+    if (results.polygons.length > 0) {
+      const polygonsGeoJson = {
+        type: "FeatureCollection",
+        features: results.polygons.map(poly => ({
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [poly.points.map(p => [p.easting, p.northing])]
+          },
+          properties: {
+            cluster_id: poly.cluster_id,
+            method: poly.method,
+            point_count: poly.points.length - 1
+          }
+        }))
+      };
+      download("polygons.geojson", JSON.stringify(polygonsGeoJson, null, 2), "application/geo+json");
+    }
+  }
+
   // PDF download removed per request
 
   return (
@@ -137,6 +215,9 @@ export default function Home() {
         <button onClick={handleDownloadTxtMode1} disabled={points.length < 2} className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50">خروجی TXT (مود 1)</button>
         <button onClick={handleDownloadTxtMode2} disabled={points.length < 2} className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50">خروجی TXT (مود 2)</button>
         <button onClick={handleDownloadKml} disabled={points.length < 2} className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50">Google Earth (KML)</button>
+        {typeof window !== 'undefined' && window.mode6Results && (
+          <button onClick={handleDownloadMode6Reports} className="bg-blue-600 text-white border border-blue-600 rounded px-4 py-2 hover:bg-blue-700">گزارش‌های مود 6</button>
+        )}
       </div>
 
       <div className="grid md:grid-cols-2 gap-4">
