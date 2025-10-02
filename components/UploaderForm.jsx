@@ -113,11 +113,104 @@ export default function UploaderForm({ onParsed }) {
     return rows;
   }
 
+  function parseTextMode3(text) {
+    const t = String(text || "").trim();
+    if (!t) {
+      setRawRows([]);
+      return [];
+    }
+    
+    // Parse CSV with header
+    const parsed = Papa.parse(t, { header: true, skipEmptyLines: true });
+    if (!parsed || !parsed.data || parsed.data.length === 0) {
+      setRawRows([]);
+      return [];
+    }
+
+    const allPoints = new Map(); // Use Map to handle duplicates by coordinates
+    const lines = [];
+
+    // Process each row to extract line information
+    parsed.data.forEach((row) => {
+      const name = row.name || row.Name || row["Point name"] || row.point || row.Point || row.id || row.ID || '';
+      const easting = Number(row.easting ?? row.Easting ?? row.EASTING ?? row.x ?? row.X ?? row.E ?? row.e ?? row.east ?? row.East);
+      const northing = Number(row.northing ?? row.Northing ?? row.NORTHING ?? row.y ?? row.Y ?? row.N ?? row.n ?? row.north ?? row.North);
+
+      if (!Number.isFinite(easting) || !Number.isFinite(northing) || !name) return;
+
+      // Extract line information from name (e.g., "ProjectName-L1-P1")
+      const lineMatch = name.match(/(.+)-L(\d+)-P([12])$/i);
+      if (lineMatch) {
+        const [, baseName, lineNum, pointNum] = lineMatch;
+        const lineId = `${baseName}-L${lineNum}`;
+        
+        if (!lines.find(l => l.id === lineId)) {
+          lines.push({ id: lineId, points: [] });
+        }
+        
+        const line = lines.find(l => l.id === lineId);
+        line.points.push({
+          name,
+          easting,
+          northing,
+          pointNum: parseInt(pointNum),
+          originalIndex: parsed.data.indexOf(row)
+        });
+      }
+
+      // Add to unique points map (key by coordinates to handle duplicates)
+      const coordKey = `${easting.toFixed(3)},${northing.toFixed(3)}`;
+      if (!allPoints.has(coordKey)) {
+        allPoints.set(coordKey, { name, easting, northing });
+      }
+    });
+
+    // Sort line points and extract unique boundary points
+    const boundaryPoints = [];
+    const processedCoords = new Set();
+
+    lines.forEach(line => {
+      // Sort points within each line (P1 first, then P2)
+      line.points.sort((a, b) => a.pointNum - b.pointNum);
+      
+      line.points.forEach(point => {
+        const coordKey = `${point.easting.toFixed(3)},${point.northing.toFixed(3)}`;
+        if (!processedCoords.has(coordKey)) {
+          processedCoords.add(coordKey);
+          boundaryPoints.push({
+            name: point.name,
+            easting: point.easting,
+            northing: point.northing
+          });
+        }
+      });
+    });
+
+    // If we have lines, try to create a polygon boundary
+    if (lines.length > 0) {
+      // Simple approach: use all unique points
+      setRawRows(boundaryPoints);
+      return boundaryPoints;
+    }
+
+    // Fallback: use all unique points
+    const uniquePoints = Array.from(allPoints.values());
+    setRawRows(uniquePoints);
+    return uniquePoints;
+  }
+
   async function onFileChange(e) {
     const file = e.target.files?.[0];
     if (!file) return;
     const text = await file.text();
-    const rows = mode === 'utm2' ? parseTextMode2(text) : parseText(text);
+    let rows;
+    if (mode === 'utm2') {
+      rows = parseTextMode2(text);
+    } else if (mode === 'utm3') {
+      rows = parseTextMode3(text);
+    } else {
+      rows = parseText(text);
+    }
     setNotice(`تعداد نقاط خوانده‌شده از فایل: ${rows.length}`);
   }
 
@@ -316,7 +409,7 @@ export default function UploaderForm({ onParsed }) {
 
 
   function handleShowOnMap() {
-    if (mode === "utm" || mode === "utm2") {
+    if (mode === "utm" || mode === "utm2" || mode === "utm3") {
       if (rawRows.length < 2) return;
       const wgs = convertManyUtmToLatLon(rawRows, { zone: Number(zone), hemisphere });
       onParsed?.({ points: wgs, projectInfo: { ...projectInfo, zone, hemisphere } });
@@ -354,15 +447,19 @@ export default function UploaderForm({ onParsed }) {
           <span>ورودی TXT / CSV (مود 2)</span>
         </label>
         <label className="flex items-center gap-2">
+          <input type="radio" name="mode" value="utm3" checked={mode === "utm3"} onChange={() => setMode("utm3")} />
+          <span>ورودی TXT / CSV (مود 3)</span>
+        </label>
+        <label className="flex items-center gap-2">
           <input type="radio" name="mode" value="dxf" checked={mode === "dxf"} onChange={() => setMode("dxf")} />
           <span>فایل DXF</span>
         </label>
       </div>
 
-      {(mode === "utm" || mode === "utm2") ? (
+      {(mode === "utm" || mode === "utm2" || mode === "utm3") ? (
       <div className="grid sm:grid-cols-2 gap-4">
         <label className="flex flex-col gap-1">
-          <span>فایل نقاط UTM (CSV/TXT)</span>
+          <span>{mode === "utm3" ? "فایل خطوط مهندسی (CSV)" : "فایل نقاط UTM (CSV/TXT)"}</span>
           <input ref={fileRef} type="file" accept=".csv,.txt" onChange={onFileChange} className="border p-2 rounded" />
         </label>
         <div className="grid grid-cols-2 gap-4">
@@ -457,7 +554,7 @@ export default function UploaderForm({ onParsed }) {
       <div className="flex gap-2 flex-nowrap">
         <button
           onClick={handleShowOnMap}
-          disabled={(((mode === "utm") || (mode === "utm2")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
+          disabled={(((mode === "utm") || (mode === "utm2") || (mode === "utm3")) && rawRows.length < 2) || (mode === "dxf" && rawRows.length < 2)}
           className="bg-white text-gray-900 border border-gray-300 rounded px-4 py-2 disabled:opacity-50 hover:bg-gray-50"
         >
           نمایش روی نقشه
