@@ -306,34 +306,40 @@ export default function UploaderForm({ onParsed }) {
       // Try lightweight parser first (works in browser without deps)
       const light = parseDxfRowsLight(text);
       if (light && light.length >= 2) return light;
-      // Fallback to dxf-parser if available
-      const mod = await import("dxf-parser");
-      const DxfParser = mod.default || mod;
-      const parser = new DxfParser();
-      const d = parser.parseSync(text);
-      const entities = Array.isArray(d?.entities) ? d.entities : [];
-      const lwps = entities.filter((e) => e.type === "LWPOLYLINE");
-      const polysClosed = lwps.filter((e) => e.closed || e.shape);
-      const lw = (polysClosed.length ? polysClosed : lwps).sort((a, b) => (b.vertices?.length || 0) - (a.vertices?.length || 0))[0];
-      let verts = [];
-      if (lw && Array.isArray(lw.vertices)) {
-        verts = lw.vertices
-          .map((v, idx) => ({ name: `P${idx + 1}`, easting: Number(v.x), northing: Number(v.y) }))
-          .filter((p) => Number.isFinite(p.easting) && Number.isFinite(p.northing));
-      } else {
-        const polys = entities.filter((e) => e.type === "POLYLINE");
-        const poly = polys.sort((a, b) => (b.vertices?.length || 0) - (a.vertices?.length || 0))[0];
-        if (poly && Array.isArray(poly.vertices)) {
-          verts = poly.vertices
-            .map((v, idx) => {
-              const x = Number(v.location?.x ?? v.x);
-              const y = Number(v.location?.y ?? v.y);
-              return { name: `P${idx + 1}`, easting: x, northing: y };
-            })
+      
+      // Fallback to dxf-parser if available (optional dependency)
+      try {
+        const mod = await import("dxf-parser");
+        const DxfParser = mod.default || mod;
+        const parser = new DxfParser();
+        const d = parser.parseSync(text);
+        const entities = Array.isArray(d?.entities) ? d.entities : [];
+        const lwps = entities.filter((e) => e.type === "LWPOLYLINE");
+        const polysClosed = lwps.filter((e) => e.closed || e.shape);
+        const lw = (polysClosed.length ? polysClosed : lwps).sort((a, b) => (b.vertices?.length || 0) - (a.vertices?.length || 0))[0];
+        let verts = [];
+        if (lw && Array.isArray(lw.vertices)) {
+          verts = lw.vertices
+            .map((v, idx) => ({ name: `P${idx + 1}`, easting: Number(v.x), northing: Number(v.y) }))
             .filter((p) => Number.isFinite(p.easting) && Number.isFinite(p.northing));
+        } else {
+          const polys = entities.filter((e) => e.type === "POLYLINE");
+          const poly = polys.sort((a, b) => (b.vertices?.length || 0) - (a.vertices?.length || 0))[0];
+          if (poly && Array.isArray(poly.vertices)) {
+            verts = poly.vertices
+              .map((v, idx) => {
+                const x = Number(v.location?.x ?? v.x);
+                const y = Number(v.location?.y ?? v.y);
+                return { name: `P${idx + 1}`, easting: x, northing: y };
+              })
+              .filter((p) => Number.isFinite(p.easting) && Number.isFinite(p.northing));
+          }
         }
+        return verts;
+      } catch (importError) {
+        // dxf-parser not available, use lightweight parser result
+        return light || [];
       }
-      return verts;
     } catch {
       return [];
     }
